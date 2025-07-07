@@ -22,7 +22,7 @@ class _TimetableScreenState extends State<TimetableScreen> {
   final grades = ['6', '7', '8', '9', '10'];
   final periods = ['1', '2', '3', '4', '5', '6', '7', '8'];
   int selectedGradeIndex = 0;
-  String today = 'Sunday'; // DateFormat('EEEE').format(DateTime.now());
+  String today = DateFormat('EEEE').format(DateTime.now());
   String todayDate = DateFormat('yyyy-MM-dd').format(DateTime.now());
 
   List<Map<String, dynamic>> attendance = [];
@@ -115,30 +115,72 @@ class _TimetableScreenState extends State<TimetableScreen> {
   //   }).toList();
   // }
 
+  // Future<List<Teacher>> getFreeTeachers(int period) async {
+  //   final db = await DatabaseHelper.instance.database;
+
+  //   final busyTeacherIds = timetable
+  //       .where((t) => t.period == period)
+  //       .map((t) => t.teacherId)
+  //       .toSet();
+
+  //   final subResult = await db.query(
+  //     'substitutions',
+  //     where: 'date = ? AND day = ? AND period = ?',
+  //     whereArgs: [todayDate, today, period],
+  //   );
+
+  //   final assignedTeacherIds = subResult
+  //       .map((s) => s['substitute_teacher_id'] as int)
+  //       .toSet();
+
+  //   return teachers.where((t) {
+  //     final isBusy = busyTeacherIds.contains(t.id);
+  //     final isPresent = isTeacherPresent(t.id);
+  //     final periodCount = getWorkingPeriods(t.id);
+  //     final isAlreadySubstituted = assignedTeacherIds.contains(t.id);
+  //     return !isBusy && isPresent && periodCount <= 7 && !isAlreadySubstituted;
+  //   }).toList();
+  // }
+
   Future<List<Teacher>> getFreeTeachers(int period) async {
     final db = await DatabaseHelper.instance.database;
 
-    final busyTeacherIds = timetable
-        .where((t) => t.period == period)
-        .map((t) => t.teacherId)
-        .toSet();
+    // ✅ Get all timetable entries for today (for all grades)
+    final fullDayTimetable = await db.query(
+      'timetable',
+      where: 'day = ?',
+      whereArgs: [today],
+    );
 
+    // ✅ Get substitutions already done for this date/day/period
     final subResult = await db.query(
       'substitutions',
       where: 'date = ? AND day = ? AND period = ?',
       whereArgs: [todayDate, today, period],
     );
 
-    final assignedTeacherIds = subResult
-        .map((s) => s['substitute_teacher_id'] as int)
+    final assignedSubstituteIds = subResult
+        .map((e) => e['substitute_teacher_id'] as int)
+        .toSet();
+
+    // ✅ Find teacher IDs already busy for this period (default timetable)
+    final busyAtPeriodTeacherIds = fullDayTimetable
+        .where((e) => e['period'] == period)
+        .map((e) => e['teacher_id'] as int)
         .toSet();
 
     return teachers.where((t) {
-      final isBusy = busyTeacherIds.contains(t.id);
       final isPresent = isTeacherPresent(t.id);
-      final periodCount = getWorkingPeriods(t.id);
-      final isAlreadySubstituted = assignedTeacherIds.contains(t.id);
-      return !isBusy && isPresent && periodCount < 7 && !isAlreadySubstituted;
+
+      // ✅ Count total periods today for this teacher (not just selected grade)
+      final periodsToday = fullDayTimetable
+          .where((e) => e['teacher_id'] == t.id)
+          .length;
+
+      final isBusy = busyAtPeriodTeacherIds.contains(t.id);
+      final isAlreadySubstituted = assignedSubstituteIds.contains(t.id);
+
+      return isPresent && !isBusy && !isAlreadySubstituted && periodsToday < 7;
     }).toList();
   }
 
@@ -147,7 +189,8 @@ class _TimetableScreenState extends State<TimetableScreen> {
       (sub) =>
           sub.absentTeacherId == teacherId &&
           sub.period == period &&
-          sub.grade == grade,
+          sub.grade == grade &&
+          sub.day == today,
     );
   }
 
@@ -161,7 +204,8 @@ class _TimetableScreenState extends State<TimetableScreen> {
       (sub) =>
           sub.absentTeacherId == absentTeacherId &&
           sub.period == period &&
-          sub.grade == grade,
+          sub.grade == grade &&
+          sub.day == today,
       orElse: () => SubstitutionEntry(
         id: 0,
         date: 'date',
@@ -182,6 +226,34 @@ class _TimetableScreenState extends State<TimetableScreen> {
     return teacher.name;
   }
 
+  int? getSubstitutedTeacherID(int absentTeacherId, int period, String grade) {
+    // Find the substitution that matches the given details
+    final subTeacher = substitutions.firstWhere(
+      (sub) =>
+          sub.absentTeacherId == absentTeacherId &&
+          sub.period == period &&
+          sub.grade == grade &&
+          sub.day == today,
+      orElse: () => SubstitutionEntry(
+        id: 0,
+        date: 'date',
+        day: 'day',
+        period: 0,
+        grade: 'grade',
+        absentTeacherId: 0,
+        substituteTeacherId: 0,
+      ),
+    );
+
+    // Find the teacher by absentTeacherId
+    final teacher = teachers.firstWhere(
+      (teacher) => teacher.id == subTeacher.substituteTeacherId,
+      orElse: () => Teacher(id: 0, name: 'No Name', subject: 'No Subject'),
+    );
+
+    return teacher.id;
+  }
+
   void showAvailableTeachersDialog(int period, String grade) async {
     final freeTeachers = await getFreeTeachers(period);
 
@@ -191,47 +263,142 @@ class _TimetableScreenState extends State<TimetableScreen> {
         title: Text('Available Teachers for Period $period'),
         content: freeTeachers.isEmpty
             ? Text('No available teachers found.')
-            : Column(
-                mainAxisSize: MainAxisSize.min,
-                children: freeTeachers
-                    .map(
-                      (t) => ListTile(
-                        title: Text(t.name),
-                        subtitle: Text(t.subject),
-                        trailing: TextButton(
-                          child: Text("Assign"),
-                          onPressed: () async {
-                            final db = await DatabaseHelper.instance.database;
-                            await db.insert('substitutions', {
-                              'date': todayDate,
-                              'day': today,
-                              'period': period,
-                              'grade': grade,
-                              'absent_teacher_id': timetable
-                                  .firstWhere((e) => e.period == period)
-                                  .teacherId,
-                              'substitute_teacher_id': t.id,
-                            });
-                            setState(() {
-                              teachers = [];
-                              attendance = [];
-                              substitutions = [];
-                              timetable = [];
-                            });
-                            loadTeachersAndTimetable();
-                            Navigator.pop(context);
-                            ScaffoldMessenger.of(context).showSnackBar(
-                              SnackBar(
-                                content: Text(
-                                  "Substitute assigned successfully",
+            : SingleChildScrollView(
+                child: Column(
+                  mainAxisSize: MainAxisSize.min,
+                  children: freeTeachers
+                      .map(
+                        (t) => ListTile(
+                          title: Text(t.name),
+                          subtitle: Text(t.subject),
+                          trailing: TextButton(
+                            child: Text("Assign"),
+                            onPressed: () async {
+                              final db = await DatabaseHelper.instance.database;
+                              await db.insert('substitutions', {
+                                'date': todayDate,
+                                'day': today,
+                                'period': period,
+                                'grade': grade,
+                                'absent_teacher_id': timetable
+                                    .firstWhere((e) => e.period == period)
+                                    .teacherId,
+                                'substitute_teacher_id': t.id,
+                              });
+                              setState(() {
+                                teachers = [];
+                                attendance = [];
+                                substitutions = [];
+                                timetable = [];
+                              });
+                              loadTeachersAndTimetable();
+                              Navigator.pop(context);
+                              ScaffoldMessenger.of(context).showSnackBar(
+                                SnackBar(
+                                  content: Text(
+                                    "Substitute assigned successfully",
+                                  ),
                                 ),
-                              ),
-                            );
-                          },
+                              );
+                            },
+                          ),
                         ),
-                      ),
-                    )
-                    .toList(),
+                      )
+                      .toList(),
+                ),
+              ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(context),
+            child: Text('Close'),
+          ),
+        ],
+      ),
+    );
+  }
+
+  void showAlreadyAssignedAvailableTeachersDialog(
+    int period,
+    String grade,
+    String assignedName,
+    int absentTeacherId,
+    int substituteTeacherId,
+  ) async {
+    final freeTeachers = await getFreeTeachers(period);
+
+    showDialog(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: Text(
+          'Assigned - $assignedName',
+          style: TextStyle(
+            color: AppColors.redAccentColor,
+            fontWeight: FontWeight.bold,
+          ),
+        ),
+        content: freeTeachers.isEmpty
+            ? Text('No available teachers found.')
+            : SingleChildScrollView(
+                child: Column(
+                  mainAxisSize: MainAxisSize.min,
+                  children: freeTeachers
+                      .map(
+                        (t) => ListTile(
+                          title: Text(t.name),
+                          subtitle: Text(t.subject),
+                          trailing: TextButton(
+                            child: t.name == assignedName
+                                ? Text("Assigned")
+                                : Text("Assign"),
+                            onPressed: () async {
+                              final db = await DatabaseHelper.instance.database;
+
+                              await db.delete(
+                                'substitutions',
+                                where:
+                                    'date = ? AND day = ? AND period = ? AND grade = ? AND absent_teacher_id = ? AND substitute_teacher_id = ?',
+                                whereArgs: [
+                                  todayDate,
+                                  today,
+                                  period,
+                                  grade,
+                                  absentTeacherId,
+                                  substituteTeacherId,
+                                ],
+                              );
+
+                              await db.insert('substitutions', {
+                                'date': todayDate,
+                                'day': today,
+                                'period': period,
+                                'grade': grade,
+                                'absent_teacher_id': timetable
+                                    .firstWhere((e) => e.period == period)
+                                    .teacherId,
+                                'substitute_teacher_id': t.id,
+                              });
+                              setState(() {
+                                teachers = [];
+                                attendance = [];
+                                substitutions = [];
+                                timetable = [];
+                              });
+
+                              loadTeachersAndTimetable();
+                              Navigator.pop(context);
+                              ScaffoldMessenger.of(context).showSnackBar(
+                                SnackBar(
+                                  content: Text(
+                                    "Substitute assigned successfully",
+                                  ),
+                                ),
+                              );
+                            },
+                          ),
+                        ),
+                      )
+                      .toList(),
+                ),
               ),
         actions: [
           TextButton(
@@ -325,15 +492,33 @@ class _TimetableScreenState extends State<TimetableScreen> {
                               grades[selectedGradeIndex],
                             ) ==
                             true) {
-                          ScaffoldMessenger.of(context).showSnackBar(
-                            SnackBar(
-                              content: CustomText(
-                                text:
-                                    'You’ve already assigned a teacher for this period.',
-                                fontsize: 11,
-                                color: Colors.white,
-                              ),
-                            ),
+                          // ScaffoldMessenger.of(context).showSnackBar(
+                          //   SnackBar(
+                          //     content: CustomText(
+                          //       text:
+                          //           'You’ve already assigned a teacher for this period.',
+                          //       fontsize: 11,
+                          //       color: Colors.white,
+                          //     ),
+                          //   ),
+                          // );
+
+                          showAlreadyAssignedAvailableTeachersDialog(
+                            periodNumber,
+                            grades[selectedGradeIndex],
+                            getSubstitutedTeacherName(
+                                  teacher.id,
+                                  periodNumber,
+                                  grades[selectedGradeIndex],
+                                ) ??
+                                '',
+                            teacher.id,
+                            getSubstitutedTeacherID(
+                                  teacher.id,
+                                  periodNumber,
+                                  grades[selectedGradeIndex],
+                                ) ??
+                                -1,
                           );
                         } else {
                           if (isTeacherPresent(teacher.id) && teacher.id != 0) {
@@ -430,27 +615,27 @@ class _TimetableScreenState extends State<TimetableScreen> {
       child: Row(
         mainAxisAlignment: MainAxisAlignment.start,
         children: [
-          CustomText(
-            text: 'Period $number',
-            fontsize: 15,
-            fontWeight: FontWeight.w600,
-            color: textColor,
-            textalign: TextAlign.left,
+          Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              CustomText(
+                text: 'Period $number',
+                fontsize: 16,
+                fontWeight: FontWeight.w600,
+                color: textColor,
+                textalign: TextAlign.left,
+              ),
+              CustomText(text: subject, fontsize: 13, color: textColor),
+            ],
           ),
           //SizedBox(width: 15),
           //CustomText(text: time, fontsize: 13),
           Spacer(),
-          Column(
-            crossAxisAlignment: CrossAxisAlignment.end,
-            children: [
-              CustomText(text: subject, fontsize: 13, color: textColor),
-              CustomText(
-                text: teacher,
-                fontsize: 15,
-                fontWeight: FontWeight.w600,
-                color: textColor,
-              ),
-            ],
+          CustomText(
+            text: teacher,
+            fontsize: 15,
+            fontWeight: FontWeight.w600,
+            color: textColor,
           ),
         ],
       ),
